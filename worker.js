@@ -1,169 +1,112 @@
-/**
- * ZORO x S7 – YT-DLP WORKER SERVER
- * Runs yt-dlp + ffmpeg
- * Uses cookies
- * Supports: video, audio, max quality, 60fps+
- */
-
 const express = require("express");
 const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const axios = require("axios");
 
 const app = express();
+app.use(express.json());
 
-/* =========================
-   ⚙️ CONFIG
-========================= */
+// CONFIG
 const PORT = process.env.PORT || 4001;
+const MASTER_URL = "https://yt-downloader-api-s7.onrender.com";
+const MY_WORKER_URL = process.env.WORKER_URL; // Render Environment Variable mein dalo
+const CLUSTER_SECRET = "MY_SUPER_SECRET_KEY"; 
 
-// cookies.txt must exist in same folder
+const TEMP_DIR = path.join(__dirname, "temp");
 const COOKIES_PATH = path.join(__dirname, "cookies.txt");
 
-// temp folder (important for Render / Railway)
-const TEMP_DIR = path.join(__dirname, "temp");
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
-// force temp usage
-process.env.TMPDIR = TEMP_DIR;
-process.env.TEMP = TEMP_DIR;
-process.env.TMP = TEMP_DIR;
-
-/* =========================
-   🟢 HEALTH CHECK
-========================= */
-app.get("/", (req, res) => {
-  res.json({
-    status: "WORKER ONLINE ✅",
-    engine: "yt-dlp",
-    cookies: fs.existsSync(COOKIES_PATH),
-    port: PORT
-  });
-});
-
-/* =========================
-   🎥 VIDEO DOWNLOAD
-========================= */
-app.get("/video", (req, res) => {
-  const { url, quality } = req.query;
-  if (!url || !quality) {
-    return res.status(400).json({ error: "url & quality required" });
+/* =========================================
+   💓 HEARTBEAT LOGIC (Connects to Master)
+========================================= */
+const pingMaster = async () => {
+  try {
+    await axios.post(`${MASTER_URL}/cluster/ping`, {
+      url: MY_WORKER_URL,
+      secret: CLUSTER_SECRET
+    });
+    console.log("📡 Ping sent to Master...");
+  } catch (err) {
+    console.error("❌ Master connection failed. Retrying in 10s...");
   }
+};
 
-  const fileName = `video_${Date.now()}.mp4`;
-  const filePath = path.join(TEMP_DIR, fileName);
+setInterval(pingMaster, 20000); // 20 sec heartbeat
+pingMaster(); // Boot up ping
 
-  // 🎯 FORMAT LOGIC
-  let format;
-  if (quality === "max") {
-    // MAX = best resolution + best fps (60/120 if available)
-    format = "bv*[fps>30]/bv*+ba/best";
+/* =========================================
+   ⚙️ JOB EXECUTION (yt-dlp + ffmpeg)
+========================================= */
+
+app.post("/execute", (req, res) => {
+  if (req.headers["x-cluster-secret"] !== CLUSTER_SECRET) return res.status(403).send("Forbidden");
+
+  const { type, url, quality } = req.body;
+  const jobId = Date.now();
+  
+  console.log(`📥 Processing ${type} | ${quality || 'audio'} | ${url}`);
+
+  let cmd = "";
+  let fileName = "";
+  let mimeType = "";
+
+  const commonArgs = `--cookies "${COOKIES_PATH}" --no-playlist --extractor-args "youtube:player_client=android"`;
+
+  if (type === "video") {
+    fileName = `video_${jobId}.mp4`;
+    mimeType = "video/mp4";
+    
+    // Quality Logic
+    let format = "";
+    if (quality === "max") {
+      format = "bv*[fps>30]/bv*+ba/best";
+    } else {
+      format = `bv*[height<=${quality}][fps>30]/bv*[height<=${quality}]+ba/best`;
+    }
+
+    cmd = `yt-dlp ${commonArgs} -f "${format}" --merge-output-format mp4 "${url}" -o "${path.join(TEMP_DIR, fileName)}"`;
+
   } else {
-    // specific resolution with preference to 60fps
-    format = `bv*[height<=${quality}][fps>30]/bv*[height<=${quality}]+ba/best`;
+    fileName = `audio_${jobId}.mp3`;
+    mimeType = "audio/mpeg";
+    cmd = `yt-dlp ${commonArgs} -x --audio-format mp3 --audio-quality 0 "${url}" -o "${path.join(TEMP_DIR, fileName)}"`;
   }
 
-  const cmd = `
-yt-dlp
---cookies "${COOKIES_PATH}"
---no-playlist
---extractor-args "youtube:player_client=android"
---merge-output-format mp4
--f "${format}"
-"${url}"
--o "${filePath}"
-`.replace(/\n/g, " ");
+  // Execute yt-dlp
+  exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
+    const filePath = path.join(TEMP_DIR, fileName);
 
-  console.log(`🎥 VIDEO | ${quality} | ${url}`);
-
-  exec(cmd, { maxBuffer: 1024 * 1024 * 20 }, (err, stdout, stderr) => {
     if (err || !fs.existsSync(filePath)) {
-      console.error("❌ VIDEO FAILED:", stderr || err);
-      return res.status(500).json({ error: "video download failed" });
+      console.error(`❌ yt-dlp Error:`, stderr);
+      return res.status(500).json({ error: "Download Failed", details: stderr });
     }
 
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${fileName}"`
-    );
-    res.setHeader("Content-Type", "video/mp4");
-
-    res.sendFile(filePath, () => {
-      fs.unlink(filePath, () => {});
-      console.log(`🧹 CLEANED: ${fileName}`);
+    // Stream back to Master
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.setHeader("Content-Type", mimeType);
+    
+    res.sendFile(filePath, (sendErr) => {
+      if (!sendErr) {
+        fs.unlink(filePath, () => console.log(`🧹 Cleaned up: ${fileName}`));
+      }
     });
   });
 });
 
-/* =========================
-   🎵 AUDIO MP3
-========================= */
-app.get("/audio", (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).json({ error: "url required" });
-
-  const fileName = `audio_${Date.now()}.mp3`;
-  const filePath = path.join(TEMP_DIR, fileName);
-
-  const cmd = `
-yt-dlp
---cookies "${COOKIES_PATH}"
---no-playlist
--x
---audio-format mp3
---audio-quality 0
-"${url}"
--o "${filePath}"
-`.replace(/\n/g, " ");
-
-  console.log(`🎵 AUDIO | ${url}`);
-
-  exec(cmd, { maxBuffer: 1024 * 1024 * 10 }, (err) => {
-    if (err || !fs.existsSync(filePath)) {
-      console.error("❌ AUDIO FAILED");
-      return res.status(500).json({ error: "audio download failed" });
-    }
-
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${fileName}"`
-    );
-    res.setHeader("Content-Type", "audio/mpeg");
-
-    res.sendFile(filePath, () => {
-      fs.unlink(filePath, () => {});
-      console.log(`🧹 CLEANED: ${fileName}`);
-    });
-  });
-});
-
-/* =========================
-   🧹 AUTO CLEAN (Failsafe)
-========================= */
+/* =========================================
+   🧹 FAILSAVE CLEANER
+========================================= */
 setInterval(() => {
   fs.readdir(TEMP_DIR, (err, files) => {
     if (err) return;
-    files.forEach(f => {
-      const p = path.join(TEMP_DIR, f);
-      fs.stat(p, (e, s) => {
-        if (!e && Date.now() - s.mtimeMs > 60 * 60 * 1000) {
-          fs.unlink(p, () => {});
-        }
-      });
+    files.forEach(file => {
+      const p = path.join(TEMP_DIR, file);
+      const stat = fs.statSync(p);
+      if (Date.now() - stat.mtimeMs > 3600000) fs.unlink(p, () => {}); // 1hr old files delete
     });
   });
-}, 30 * 60 * 1000);
+}, 600000);
 
-/* =========================
-   🚀 START
-========================= */
-app.listen(PORT, () => {
-  console.log(`
-=====================================
-🧵 WORKER STARTED
-🌐 Port    : ${PORT}
-🍪 Cookies : ${fs.existsSync(COOKIES_PATH)}
-📂 Temp    : ${TEMP_DIR}
-=====================================
-`);
-});
+app.listen(PORT, () => console.log(`🧵 Worker online at ${PORT}`));
