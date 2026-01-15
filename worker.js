@@ -10,7 +10,8 @@ app.use(express.json());
 // CONFIG
 const PORT = process.env.PORT || 4001;
 const MASTER_URL = "https://yt-downloader-api-s7.onrender.com";
-const MY_WORKER_URL = process.env.WORKER_URL; // Render Environment Variable mein dalo
+const MY_WORKER_URL = process.env.WORKER_URL || `http://localhost:${PORT}`; 
+
 const CLUSTER_SECRET = "MY_SUPER_SECRET_KEY"; 
 
 const TEMP_DIR = path.join(__dirname, "temp");
